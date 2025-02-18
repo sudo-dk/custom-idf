@@ -95,7 +95,7 @@ jobs:
             --embedded-services idf,qemu \
             --junit-xml test_${{ matrix.target }}_${{ matrix.idf-branch }}.xml \
             --build-dir build_${{ matrix.target }}_${{ matrix.idf-branch }}
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test_${{ matrix.target }}_${{ matrix.idf-branch }}_junit
