@@ -1,102 +1,109 @@
-name: Build and Test Application
+name: Build and Run Apps
 
 on:
   pull_request:
-    paths:
-      - "src/**/*.c"
+    types: [opened, reopened, synchronize]
   push:
     branches:
-      - main
-
-env:
-  IDF_PATH: /opt/esp/idf
-  test_dirs: examples
-
-defaults:
-  run:
-    shell: bash
+      - master
 
 jobs:
+  prepare:
+    name: Prepare pipeline
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      test_all_apps: ${{ steps.get_labels.outputs.test_all_apps }}
+      build_only: ${{ steps.get_labels.outputs.build_only }}
+      idf_build_apps_args: ${{ steps.find_changes.outputs.idf_build_apps_args }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - name: Fix git repo permissions
+        # Needed by the next git diff step.
+        # See https://github.com/actions/runner/issues/2033
+        if: github.event_name == 'pull_request'
+        run: |
+          build_dir=$PWD
+          cd /
+          git config --global --add safe.directory $build_dir
+          cd -
+      - name: Install dependencies
+        run: pip install 'idf-build-apps>=2.4,<2.5'
+      - name: Get labels
+        id: get_labels
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Check for labels
+        # "PR: test all apps"
+        # "PR: build only"
+        run: |
+          gh api --jq '.labels.[].name' /repos/{owner}/{repo}/pulls/${{ github.event.number }} > labels.txt
+          test_all_apps=$(grep -c 'PR: test all apps' labels.txt || true)
+          build_only=$(grep -c 'PR: build only' labels.txt || true)
+          echo "test_all_apps=$test_all_apps" >> $GITHUB_OUTPUT
+          echo "build_only=$build_only" >> $GITHUB_OUTPUT
+          echo "test_all_apps=$test_all_apps"
+          echo "build_only=$build_only"
+          
+      - name: Find changed files and components
+        id: find_changes
+        if: github.event_name == 'pull_request' && steps.get_labels.outputs.test_all_apps == '0'
+        # - based on the files list, determine which components have changed
+        # - output both lists as a file of idf-build-apps arguments
+        run: |
+          git fetch --recurse-submodules=no origin ${{ github.base_ref }}:base_ref
+          git fetch --recurse-submodules=no origin pull/${{ github.event.pull_request.number }}/head:pr_ref
+          git diff --name-only -r base_ref pr_ref > changed_files.txt
+          python3 .github/get_idf_build_apps_args.py -v changed_files.txt idf_build_apps_args.txt
+          echo "idf_build_apps_args=$(cat idf_build_apps_args.txt)" >> $GITHUB_OUTPUT
+          echo "idf_build_apps_args=$(cat idf_build_apps_args.txt)"
+
   build:
-    name: Build Test App
+    name: Build Apps
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
-        # choose the version of ESP-IDF to use for the build
-        idf-branch:
-          # - release-v5.0
-          # - release-v5.1
-          - latest
-        # choose the target to build for
-        target:
-          - esp32c3
+        idf_ver: 
+          - "latest"
+        parallel_index: [1,2,3,4,5] # Update --parallel-count below when changing this
     runs-on: ubuntu-22.04
-    container:
-      image: espressif/idf:${{ matrix.idf-branch }}
+    container: espressif/idf:${{ matrix.idf_ver }}
     steps:
-      - uses: actions/checkout@v3
-      - name: Install Python Dependencies
-        run: |
-          . $IDF_PATH/export.sh
-          python -m pip install idf-build-apps
-      - name: Build Test Application with ESP-IDF
-        run: |
-          . $IDF_PATH/export.sh
-          idf-build-apps build \
-            -p ${{ env.test_dirs }} \
-            --target ${{ matrix.target }} \
-            --recursive \
-            --build-dir build_${{ matrix.target }}_${{ matrix.idf-branch }}
-      - name: Upload files to artifacts for run-target job
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: built_binaries_${{ matrix.target }}_${{ matrix.idf-branch }}
-          path: |
-            **/build**/bootloader/bootloader.bin
-            **/build**/partition_table/partition-table.bin
-            **/build**/*.bin
-            **/build**/*.elf
-            **/build**/flasher_args.json
-          if-no-files-found: error
-  target-test:
-    name: Run Test App on Target (QEMU)
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        # choose the version of ESP-IDF to use for the build
-        idf-branch:
-          # - release-v5.0
-          # - release-v5.1
-          - latest
-        # choose the target to build for
-        target:
-          - esp32
-          - esp32c3
-    runs-on: ubuntu-22.04
-    container:
-      image: hfudev/qemu:main
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/download-artifact@v4
-        with:
-          name: built_binaries_${{ matrix.target }}_${{ matrix.idf-branch }}
-      - name: Install Python packages
+          submodules: 'true'
+      - name: Install dependencies
+        shell: bash
         run: |
-          . $IDF_PATH/export.sh
-          pip install \
-            pytest-embedded-idf \
-            pytest-embedded-qemu
-      - name: Run Test App on target
+          . ${IDF_PATH}/export.sh
+          pip install --upgrade idf-component-manager 'idf-build-apps>=2.4,<2.5'
+      - name: Build apps
+        shell: bash
         run: |
-          . $IDF_PATH/export.sh
-          pytest ${{ env.test_dirs }} \
-            --target ${{ matrix.target }} \
-            --embedded-services idf,qemu \
-            --junit-xml test_${{ matrix.target }}_${{ matrix.idf-branch }}.xml \
-            --build-dir build_${{ matrix.target }}_${{ matrix.idf-branch }}
+          . ${IDF_PATH}/export.sh
+          export PEDANTIC_FLAGS="-DIDF_CI_BUILD -Werror -Werror=deprecated-declarations -Werror=unused-variable -Werror=unused-but-set-variable -Werror=unused-function"
+          export EXTRA_CFLAGS="${PEDANTIC_FLAGS} -Wstrict-prototypes"
+          export EXTRA_CXXFLAGS="${PEDANTIC_FLAGS}"
+          idf-build-apps build --parallel-index ${{ matrix.parallel_index }} --parallel-count 5 --collect-app-info build_info_${{ matrix.idf_ver }}_${{ matrix.parallel_index }}.json ${{ needs.prepare.outputs.idf_build_apps_args }}
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: github.repository_owner == 'espressif' && needs.prepare.outputs.build_only == '0'
         with:
-          name: test_${{ matrix.target }}_${{ matrix.idf-branch }}_junit
-          path: test_${{ matrix.target }}_${{ matrix.idf-branch }}.xml
+          name: app_binaries_${{ matrix.idf_ver }}_${{ matrix.parallel_index }}
+          path: |
+            */examples/*/build_esp*/bootloader/bootloader.bin
+            */examples/*/build_esp*/partition_table/partition-table.bin
+            */examples/*/build_esp*/*.bin
+            */examples/*/build_esp*/flasher_args.json
+            */examples/*/build_esp*/config/sdkconfig.json
+            */test_app*/**/build_esp*/bootloader/bootloader.bin
+            */test_app*/**/build_esp*/partition_table/partition-table.bin
+            */test_app*/**/build_esp*/*.bin
+            */test_app*/**/build_esp*/flasher_args.json
+            */test_app*/**/build_esp*/config/sdkconfig.json
+            build_info*.json
